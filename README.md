@@ -39,10 +39,6 @@ Cell-JEPA replaces all of this with a simpler framework inspired by [LeWorldMode
 
 ## Method
 
-<p align="center">
-  <img src="figures/method_overview.png" width="700"/>
-</p>
-
 1. **Encode**: A ViT-S/16 encoder (initialized from DINO-pretrained ImageNet weights, adapted to 5 fluorescence channels) processes cell images into 196 patch embeddings
 2. **Mask**: 60% of patch embeddings are randomly masked
 3. **Predict**: A lightweight transformer predictor reconstructs masked patch embeddings from visible context
