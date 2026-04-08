@@ -1,0 +1,43 @@
+# Cell-JEPA Results Log
+# Dataset: Severin PBMC (89,564 train / 24,000 test / 8 classes / 5-channel TIFF)
+# Encoder: DINO ViT-S/16 pretrained on ImageNet, adapted to 5 channels
+# Predictor: 4-layer transformer, 384-dim, 6 heads
+# Mask ratio: 60%, SIGReg weight: 10.0, LR: 1e-4, batch_size: 24
+
+## Baseline (zero-shot, no cell training)
+k=5:  0.5316
+k=10: 0.5495
+k=20: 0.5614
+k=50: 0.5608
+
+## Cell-JEPA: 1K images, 30 epochs (converged)
+k=5:  0.6761  (+0.1445)
+k=10: 0.6726  (+0.1231)
+k=20: 0.6692  (+0.1078)
+k=50: 0.6510  (+0.0902)
+Final train pred_loss: 1.71, sigreg: 7.68
+Final val pred_loss: 1.78, sigreg: 14.59
+
+## Cell-JEPA: 5K images, 24 epochs (incomplete, crashed at epoch 24/50)
+k=5:  0.6397  (+0.1081)
+k=10: 0.6389  (+0.0893)
+k=20: 0.6335  (+0.0720)
+k=50: 0.6174  (+0.0565)
+Epoch 24 train pred_loss: 0.71, sigreg: 4.85
+Epoch 24 val pred_loss: 0.67, sigreg: 12.07
+Note: Losses still decreasing when training stopped. Full training expected to improve.
+
+## Cell-JEPA: 40K images, 8 epochs (incomplete, crashed at epoch 8/50)
+k=5:  0.6379  (+0.1063)
+k=10: 0.6361  (+0.0865)
+k=20: 0.6293  (+0.0679)
+k=50: 0.6069  (+0.0460)
+Epoch 8 train pred_loss: 0.52, sigreg: 2.06
+Epoch 8 val pred_loss: 0.32, sigreg: 7.00
+Note: Only 8 of 50 planned epochs completed. Model far from converged.
+
+## Key Observations
+- 1K images with full training (30 epochs) outperforms 5K and 40K with incomplete training
+- This suggests convergence matters more than dataset size at current training budgets
+- All Cell-JEPA variants improve over baseline by +4.6 to +14.5 percentage points
+- With proper compute for full training, 40K+ results expected to significantly improve
