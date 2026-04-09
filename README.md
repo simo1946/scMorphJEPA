@@ -1,4 +1,4 @@
-# Cell-JEPA
+# scMorphJEPA
 
 ### Self-Supervised Cell Morphology Learning via Spatial Joint-Embedding Predictive Architecture
 
