@@ -1,0 +1,42 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.installed.cfg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+
+# Notebooks
+.ipynb_checkpoints/
+
+# Training artifacts and data (do not commit checkpoints or datasets)
+output/
+outputs/
+checkpoints/
+*.pt
+*.pth
+*.ckpt
+*.npz
+severin_data/
+data/
+*.tiff
+*.tif
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
