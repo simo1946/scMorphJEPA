@@ -1,0 +1,23 @@
+# Example training config for the Severin PBMC dataset.
+# Use: python -m scmorphjepa.cli train --data_dir <path> --checkpoint <dino.pth>
+dataset:
+  type: severin
+  in_channels: 5
+  image_size: 224
+  normalize: per_channel       # per_image | per_channel | per_channel_percentile
+
+model:
+  embed_dim: 384
+  predictor_depth: 4
+  predictor_heads: 6
+  mask_ratio: 0.6
+
+training:
+  batch_size: 24
+  epochs: 50
+  lr: 1.0e-4
+  weight_decay: 0.05
+  sigreg_weight: 10.0
+  n_images: 0                  # 0 = use all training images
+  num_workers: 2
+  seed: 42
