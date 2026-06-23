@@ -134,7 +134,6 @@ val_ds   = SeverinDataset("severin_data/.../Test",     normalize="per_image")
 cfg = TrainConfig(
     batch_size=24, epochs=50,
     regularizer="sigreg",      # sigreg | vicreg | koleo | barlow | none
-    normalize="per_image",     # per_image | per_channel | per_channel_percentile
     n_images=0,                # 0 = use all
     output_dir="output",
 )
@@ -148,7 +147,7 @@ from scmorphjepa.evaluation.evaluate import extract_embeddings, knn_evaluate
 
 ref   = extract_embeddings(model, train_ds, batch_size=64)
 query = extract_embeddings(model, val_ds,   batch_size=64)
-acc = knn_evaluate(ref["cls"], ref["labels"], query["cls"], query["labels"],
+acc = knn_evaluate(ref["cls_tokens"], ref["labels"], query["cls_tokens"], query["labels"],
                    k_values=[5, 10, 20])
 print({k: f"{v:.1%}" for k, v in acc.items()})
 ```
