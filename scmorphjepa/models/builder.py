@@ -57,8 +57,19 @@ def build_scmorphjepa(
         ckpt_path = Path(checkpoint_path)
         if ckpt_path.exists():
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=True)
-            encoder.load_state_dict(ckpt, strict=False)
-            logger.info(f"Loaded DINO checkpoint from {ckpt_path}")
+            missing, unexpected = encoder.load_state_dict(ckpt, strict=False)
+            n_total = len(encoder.state_dict())
+            n_loaded = n_total - len(missing)
+            logger.info(
+                f"Loaded DINO checkpoint from {ckpt_path} "
+                f"({n_loaded}/{n_total} tensors matched, {len(unexpected)} unexpected)"
+            )
+            if n_loaded < 0.5 * n_total:
+                raise RuntimeError(
+                    f"DINO checkpoint matched only {n_loaded}/{n_total} encoder tensors; the "
+                    "initialization did not take effect (wrong or corrupt file?). "
+                    "Expected a ViT-S/16 DINO state_dict."
+                )
         else:
             logger.warning(f"Checkpoint not found: {ckpt_path}")
 

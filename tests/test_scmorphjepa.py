@@ -39,6 +39,37 @@ def test_feature_extractor_schema():
     assert not df.isnull().any().any()
 
 
+def test_profile_clusters_by_features_bridges_clusters_to_features():
+    """The cluster-feature profiler links clusters to raw-image features per (type, cluster)."""
+    from scmorphjepa.analysis.feature_extractors import (
+        profile_clusters_by_features, FeatureConfig,
+    )
+
+    rng = np.random.default_rng(1)
+    n = 30
+    imgs = [rng.random((5, 50, 50)).astype(np.float32) for _ in range(n)]
+
+    class _MockDS:
+        cell_types = ["T4", "M0"]
+        labels = [i % 2 for i in range(n)]
+
+        def get_raw_image(self, i):
+            return imgs[i]
+
+    clusters = np.array([i % 4 for i in range(n)])
+    out = profile_clusters_by_features(
+        _MockDS(), clusters,
+        config=FeatureConfig(channel_names=["c0", "c1", "c2", "c3", "c4"]),
+        show_progress=False,
+    )
+    assert set(out) == {"per_cell", "per_cluster", "by_type_cluster", "state_signal"}
+    assert len(out["per_cell"]) == n
+    assert (out["per_cell"]["cluster"].values == clusters).all()
+    assert "dominant_type" in out["per_cluster"].columns
+    assert out["by_type_cluster"].index.names == ["cell_type", "cluster"]
+    assert {"cell_type", "feature", "across_cluster_spread"} <= set(out["state_signal"].columns)
+
+
 def test_cluster_composition_proportions_sum_to_one():
     """Composition rows (excluding metadata cols) should sum to 1 per cluster."""
     from scmorphjepa.analysis.cluster_profiler import compute_cluster_composition
@@ -198,3 +229,58 @@ def test_run_name_encodes_regularizer():
     assert TrainConfig(n_images=5000, epochs=100).resolved_run_name() == "scmorphjepa_n5000_e100"
     assert TrainConfig(n_images=5000, epochs=100, regularizer="vicreg").resolved_run_name() \
         == "scmorphjepa_n5000_e100_vicreg"
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_normalize_validation_and_none(tmp_path):
+    """Invalid normalize raises at construction; 'none' preserves raw pixels."""
+    import tifffile
+    from scmorphjepa.data.datasets import SeverinDataset, VALID_NORMALIZE
+
+    cls_dir = tmp_path / "Training" / "T4"
+    cls_dir.mkdir(parents=True)
+    rng = np.random.default_rng(0)
+    for j in range(3):
+        tifffile.imwrite(cls_dir / f"c{j}.tiff", (rng.random((50, 50, 5)) * 1000).astype(np.float32))
+    data_dir = tmp_path / "Training"
+
+    assert "none" in VALID_NORMALIZE
+    with pytest.raises(ValueError):
+        SeverinDataset(data_dir, normalize="_per_channel_percentile")
+
+    raw = SeverinDataset(data_dir, normalize="none").get_raw_image(0)
+    scaled = SeverinDataset(data_dir, normalize="per_image").get_raw_image(0)
+    assert raw.max() > 1.0             # raw pixel values preserved
+    assert scaled.max() <= 1.0 + 1e-6  # per_image scaled into [0, 1]
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_dino_load_fails_loud_on_mismatch(tmp_path):
+    """A checkpoint that matches almost nothing must raise, not silently random-init."""
+    import torch
+    from scmorphjepa.models.builder import build_scmorphjepa
+    from scmorphjepa.models.cell_jepa import ScMorphJEPAConfig
+
+    garbage = tmp_path / "garbage.pth"
+    torch.save({"not_a_real_key": torch.zeros(3)}, garbage)
+    with pytest.raises(RuntimeError):
+        build_scmorphjepa(checkpoint_path=str(garbage), config=ScMorphJEPAConfig(in_channels=5))
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_visreg_finite_differentiable_penalizes_collapse():
+    """VISReg is finite, differentiable, and costs more on a collapsed batch than a Gaussian one."""
+    import torch
+    from scmorphjepa.training.regularizers import build_regularizer, available_regularizers
+
+    assert "visreg" in available_regularizers()
+    reg = build_regularizer("visreg", num_projections=128)
+
+    g = torch.randn(64, 128, requires_grad=True)
+    lg = reg(g)
+    lg.backward()
+    assert torch.isfinite(lg) and lg.item() >= 0
+    assert g.grad is not None and torch.isfinite(g.grad).all()
+
+    collapsed = torch.randn(1, 128).repeat(64, 1) + 1e-4 * torch.randn(64, 128)
+    assert reg(collapsed).item() > lg.item()          # collapse costs more

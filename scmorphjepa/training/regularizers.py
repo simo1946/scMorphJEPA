@@ -18,6 +18,8 @@ or KoLeo. Treat the provided defaults as starting points and sweep the weight fo
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -113,11 +115,50 @@ class BarlowReg(nn.Module):
         return on_diag + self.lambda_off * off_diag
 
 
+class VISReg(nn.Module):
+    """Variance-Invariance-Sketching Regularization (Wu, Balestriero & Levine, arXiv 2606.02572).
+
+    A principled SIGReg/VICReg hybrid that decouples anti-collapse into three terms on the batch
+    of embeddings z (B, D):
+      * center: mean -> 0,
+      * scale:  per-dimension std -> 1 (VICReg-style variance floor, but two-sided),
+      * shape:  random 1-D projections matched to standard-Gaussian quantiles via a Sliced
+                Wasserstein Distance (SIGReg-style Cramer-Wold Gaussianity, but as QQ/order-
+                statistic matching rather than the Epps-Pulley characteristic-function test).
+    Unlike SIGReg, the scale-loss gradient stays strong at collapse (SIGReg's vanishes there).
+    `shape_weight` > 1 reproduces the paper's "VISReg*" variant, which helps on low-quality data.
+    NOTE: like every regularizer here, its numeric scale differs, so retune the training weight.
+    """
+
+    def __init__(self, num_projections: int = 256, shape_weight: float = 1.0) -> None:
+        super().__init__()
+        self.k = num_projections
+        self.shape_weight = shape_weight
+
+    def forward(self, z: torch.Tensor) -> torch.Tensor:
+        B, D = z.shape
+        mu = z.mean(dim=0)
+        center = mu.pow(2).mean()
+        z_cent = z - mu
+        # population std along the batch, computed exactly as the reference (norm / sqrt(B)),
+        # not via .std() which would re-subtract the mean and change the autograd path.
+        std = z_cent.norm(dim=0).div(math.sqrt(B)) + 1e-6
+        scale = (std - 1.0).pow(2).mean()
+        z_norm = z_cent / std.detach()
+        w = F.normalize(torch.randn(D, self.k, device=z.device, dtype=z.dtype), dim=0)
+        p_sorted = (z_norm @ w).sort(dim=0).values                       # (B, K)
+        u = torch.arange(1, B + 1, device=z.device, dtype=z.dtype) / (B + 1)
+        target = torch.erfinv(2.0 * u - 1.0).mul(math.sqrt(2.0)).unsqueeze(1)   # (B, 1) Gaussian quantiles
+        shape = (p_sorted - target).pow(2).mean()
+        return scale + self.shape_weight * shape + center
+
+
 _REGISTRY = {
     "sigreg": SIGRegWrap,
     "vicreg": VICReg,
     "koleo": KoLeo,
     "barlow": BarlowReg,
+    "visreg": VISReg,
     "none": NoReg,
 }
 
@@ -129,7 +170,7 @@ def available_regularizers() -> list[str]:
 def build_regularizer(name: str = "sigreg", **kwargs) -> nn.Module:
     """Construct a regularizer by name. kwargs are forwarded to its constructor.
 
-    Names: sigreg, vicreg, koleo, barlow, none.
+    Names: sigreg, vicreg, koleo, barlow, visreg, none.
     """
     key = name.lower()
     if key not in _REGISTRY:

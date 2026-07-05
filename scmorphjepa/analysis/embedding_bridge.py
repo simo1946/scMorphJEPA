@@ -32,7 +32,7 @@ def build_embedding_bridge(
     for col in feat_cols:
         y = features_df[col].values.astype(np.float64)
         if np.std(y) < 1e-10:
-            r2[col] = 0.0
+            r2[col] = float("nan")
             continue
         y_s = StandardScaler().fit_transform(y.reshape(-1, 1)).ravel()
         try:
@@ -41,7 +41,7 @@ def build_embedding_bridge(
             )
             r2[col] = float(np.mean(scores))
         except Exception:
-            r2[col] = 0.0
+            r2[col] = float("nan")
 
     series = pd.Series(r2).sort_values(ascending=False)
     if isinstance(series.index, pd.MultiIndex):

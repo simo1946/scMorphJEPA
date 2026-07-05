@@ -8,7 +8,7 @@ the torch-free analysis layer (scmorphjepa.analysis) can be used without importi
 torch. See PEP 562.
 """
 
-__version__ = "0.1.8"
+__version__ = "0.1.11"
 __model_name__ = "scMorphJEPA"
 
 __all__ = [

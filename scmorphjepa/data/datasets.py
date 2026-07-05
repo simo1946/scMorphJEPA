@@ -20,6 +20,12 @@ import tifffile
 
 logger = logging.getLogger(__name__)
 
+# Valid normalization modes. "none" = raw pixel values (no scaling); use it when absolute
+# intensity matters (e.g. DNA content / marker intensity for cell-state analysis) or to train/
+# evaluate on raw images. Passing anything outside this set raises, so a typo can never silently
+# fall through to returning unnormalized images.
+VALID_NORMALIZE = ("none", "per_image", "per_channel", "per_channel_percentile")
+
 
 class MicroscopyDataset(Dataset, ABC):
     """Abstract base for single-cell fluorescence microscopy datasets.
@@ -38,6 +44,11 @@ class MicroscopyDataset(Dataset, ABC):
         self.root_dir = Path(root_dir)
         self.image_size = image_size
         self.channel_names = list(channel_names) if channel_names else None
+        if normalize not in VALID_NORMALIZE:
+            raise ValueError(
+                f"normalize={normalize!r} is not valid; expected one of {VALID_NORMALIZE}. "
+                "Training and evaluation must use the same value."
+            )
         self.normalize = normalize
         self.return_path = return_path
 
@@ -68,6 +79,8 @@ class MicroscopyDataset(Dataset, ABC):
         return len(self.files)
 
     def _normalize(self, img: np.ndarray) -> np.ndarray:
+        if self.normalize == "none":
+            return img  # raw pixel values, no scaling
         if self.normalize == "per_image":
             mx = img.max()
             return img / mx if mx > 0 else img
@@ -87,7 +100,9 @@ class MicroscopyDataset(Dataset, ABC):
                 else:
                     img[c] = np.zeros_like(img[c])
             return img
-        return img
+        # Unreachable when constructed normally (__init__ validates), kept as a guard so an
+        # unexpected value can never silently return raw pixels.
+        raise ValueError(f"Unknown normalize={self.normalize!r}; expected one of {VALID_NORMALIZE}.")
 
     def _resize(self, img: np.ndarray) -> np.ndarray:
         """Resize each channel independently to image_size."""

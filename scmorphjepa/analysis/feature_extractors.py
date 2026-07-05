@@ -108,8 +108,8 @@ def _texture_features(ch: np.ndarray, ch_name: str, dists, angles) -> dict:
             feat[("texture", ch_name, f"{prop}_std")] = float(vals.std())
     except Exception:
         for prop in ["contrast", "correlation", "homogeneity", "energy"]:
-            feat[("texture", ch_name, f"{prop}_mean")] = 0.0
-            feat[("texture", ch_name, f"{prop}_std")] = 0.0
+            feat[("texture", ch_name, f"{prop}_mean")] = float("nan")
+            feat[("texture", ch_name, f"{prop}_std")] = float("nan")
     return feat
 
 
@@ -167,3 +167,113 @@ def extract_dataset_features(
 
     logger.info(f"Extracted {len(keys)} features from {n} cells")
     return df
+
+
+def profile_clusters_by_features(
+    dataset,
+    cluster_labels,
+    indices=None,
+    cell_type_labels=None,
+    cell_type_names=None,
+    config: "FeatureConfig | None" = None,
+    top_state_features: int = 8,
+    show_progress: bool = True,
+) -> dict:
+    """Link clusters to interpretable raw-image features to probe cell state.
+
+    For each cell it extracts CellProfiler-lite features (intensity / morphology / texture,
+    via ``extract_dataset_features``) from its raw image, then summarizes them per cluster and
+    per (cell_type, cluster). The intended question: when one cell type spreads across several
+    clusters, do those sub-clusters differ in size, DNA content (integrated DAPI ~ cell cycle),
+    or marker intensity (~ activation), i.e. are they distinct cell states rather than noise?
+
+    Intensity features are only meaningful if the dataset preserves intensity: build it with
+    ``normalize="none"`` (raw) or ``normalize="per_image"`` for this analysis.
+
+    Args:
+        dataset: a MicroscopyDataset exposing ``get_raw_image(i)``; ``.labels`` and ``.cell_types``
+            are used to fill cell types if not given.
+        cluster_labels: (N,) cluster id per cell.
+        indices: (N,) dataset indices the labels correspond to (default ``range(N)``).
+        cell_type_labels: (N,) ground-truth type id per cell (default: read from the dataset).
+        cell_type_names: list mapping type id -> name (default: ``dataset.cell_types``).
+        config: FeatureConfig; set ``channel_names`` so features are readable.
+        top_state_features: how many candidate state features to surface per cell type.
+
+    Returns dict with:
+        per_cell:        DataFrame, one row/cell: cell_index, cell_type, cluster, + features.
+        per_cluster:     DataFrame, one row/cluster: size, dominant_type, mean of each feature.
+        by_type_cluster: DataFrame grouped by (cell_type, cluster): size + mean of each feature.
+        state_signal:    DataFrame ranking, per cell type, the features that vary most across
+                         that type's clusters (candidate cell-state axes).
+    """
+    import numpy as np
+    import pandas as pd
+
+    cluster_labels = np.asarray(cluster_labels)
+    n = len(cluster_labels)
+    if indices is None:
+        indices = np.arange(n)
+    indices = np.asarray(indices)
+    if len(indices) != n:
+        raise ValueError(f"indices ({len(indices)}) and cluster_labels ({n}) length mismatch")
+
+    if cell_type_names is None:
+        cell_type_names = list(getattr(dataset, "cell_types", []))
+    if cell_type_labels is None:
+        ds_labels = np.asarray(getattr(dataset, "labels", []))
+        cell_type_labels = ds_labels[indices] if len(ds_labels) else np.full(n, -1)
+    cell_type_labels = np.asarray(cell_type_labels)
+
+    def type_name(t):
+        t = int(t)
+        return cell_type_names[t] if 0 <= t < len(cell_type_names) else str(t)
+
+    images = [dataset.get_raw_image(int(i)) for i in indices]
+    feats = extract_dataset_features(images, config=config, show_progress=show_progress)
+    # Flatten the MultiIndex feature columns to readable strings.
+    feats = feats.copy()
+    feats.columns = ["/".join(str(x) for x in col) for col in feats.columns]
+    feature_cols = list(feats.columns)
+
+    per_cell = feats
+    per_cell.insert(0, "cell_index", indices)
+    per_cell.insert(1, "cell_type", [type_name(t) for t in cell_type_labels])
+    per_cell.insert(2, "cluster", cluster_labels)
+
+    def _dominant(sub):
+        return sub["cell_type"].value_counts().idxmax() if len(sub) else None
+
+    # Per-cluster summary
+    rows = []
+    for cl, sub in per_cell.groupby("cluster"):
+        row = {"cluster": cl, "size": len(sub), "dominant_type": _dominant(sub)}
+        row.update(sub[feature_cols].mean().to_dict())
+        rows.append(row)
+    per_cluster = pd.DataFrame(rows).set_index("cluster").sort_index()
+
+    # Per (cell_type, cluster) summary
+    by_type_cluster = (
+        per_cell.groupby(["cell_type", "cluster"])[feature_cols].mean()
+    )
+    by_type_cluster.insert(0, "size", per_cell.groupby(["cell_type", "cluster"]).size())
+
+    # State signal: within each cell type, how much does each feature vary across its clusters?
+    # High spread of per-cluster means => that feature separates the type's sub-populations.
+    sig_rows = []
+    for ct, sub in per_cell.groupby("cell_type"):
+        if sub["cluster"].nunique() < 2:
+            continue
+        cluster_means = sub.groupby("cluster")[feature_cols].mean()
+        # normalize each feature by its overall std so features are comparable
+        overall_std = sub[feature_cols].std().replace(0, np.nan)
+        spread = (cluster_means.max() - cluster_means.min()) / overall_std
+        spread = spread.dropna().sort_values(ascending=False)
+        for feat, val in spread.head(top_state_features).items():
+            sig_rows.append({"cell_type": ct, "feature": feat,
+                             "across_cluster_spread": round(float(val), 3),
+                             "n_clusters": int(sub["cluster"].nunique())})
+    state_signal = pd.DataFrame(sig_rows)
+
+    return {"per_cell": per_cell, "per_cluster": per_cluster,
+            "by_type_cluster": by_type_cluster, "state_signal": state_signal}
