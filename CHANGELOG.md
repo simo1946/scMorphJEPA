@@ -168,3 +168,32 @@ All findings were verified against the actual code before fixing.
   start. With drive_save_every=1 it equals epoch_completed; if you raise drive_save_every to
   reduce Drive revisions, this field tells you exactly how far behind the recoverable point is.
 - Resume log now states the source (Drive vs local) and the completed epoch it loaded.
+
+## v0.1.9 — Explicit `none` normalization, fail-fast validation, cluster-feature profiler
+
+- Added `normalize="none"` (raw pixel values, no scaling), for training/evaluating on raw images
+  or for intensity-preserving feature extraction (DNA content, marker intensity).
+- Normalization is now validated at dataset construction: an unrecognized value raises `ValueError`
+  instead of silently returning raw, unnormalized images. Valid set: `none`, `per_image`,
+  `per_channel`, `per_channel_percentile`. This closes a footgun where a stray character in the
+  normalize string (e.g. a leading underscore) silently produced a train/eval mismatch.
+- New `analysis.profile_clusters_by_features`: links cluster assignments to CellProfiler-lite
+  raw-image features and summarizes them per cluster and per (cell_type, cluster), plus a
+  `state_signal` table ranking the features that vary most across each cell type's clusters
+  (candidate cell-state axes: size, DNA content, marker intensity).
+
+## v0.1.10 — Audit hardening (silent-failure class)
+
+- DINO initialization now verifies the load took effect: build_scmorphjepa reports how many encoder
+  tensors matched and raises if fewer than half do, instead of silently proceeding with a random
+  encoder while logging success (a wrong/corrupt DINO file used to pass unnoticed).
+- Analysis feature extractors and embedding_bridge now emit NaN (visible) rather than 0.0 on an
+  internal failure, so a failed texture/ridge computation can't masquerade as a real value.
+
+## v0.1.11 — VISReg regularizer
+
+- Added `regularizer="visreg"`: Variance-Invariance-Sketching Regularization (Wu, Balestriero &
+  Levine, arXiv 2606.02572), a SIGReg/VICReg hybrid decoupling anti-collapse into center + scale
+  (per-dim std -> 1) + shape (random projections matched to Gaussian quantiles via a sliced
+  Wasserstein distance). Its scale-loss gradient stays strong at collapse, where SIGReg's vanishes.
+  `shape_weight` > 1 reproduces the paper's "VISReg*" variant. Retune the training weight per usual.

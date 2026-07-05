@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scmorphjepa"
-version = "0.1.8"
+version = "0.1.11"
 description = "scMorphJEPA: Self-supervised cell morphology learning via spatial JEPA + SIGReg"
 readme = "README.md"
 license = {text = "MIT"}
