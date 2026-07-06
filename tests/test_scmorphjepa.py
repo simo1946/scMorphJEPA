@@ -210,7 +210,7 @@ def test_extract_embeddings_no_masking():
 def test_all_regularizers_finite_and_differentiable():
     """Every regularizer returns a finite scalar; non-trivial ones backprop into a real loss."""
     from scmorphjepa.training.regularizers import build_regularizer, available_regularizers
-    assert set(available_regularizers()) == {"sigreg", "vicreg", "koleo", "barlow", "none"}
+    assert set(available_regularizers()) == {"sigreg", "vicreg", "koleo", "barlow", "visreg", "none"}
     z = _torch.randn(16, 384, requires_grad=True)
     for name in available_regularizers():
         reg = build_regularizer(name)
