@@ -4,7 +4,7 @@ dataset:
   type: severin
   in_channels: 5
   image_size: 224
-  normalize: per_channel       # per_image | per_channel | per_channel_percentile
+  normalize: per_channel       # none | per_image | per_channel | per_channel_percentile
 
 model:
   embed_dim: 384

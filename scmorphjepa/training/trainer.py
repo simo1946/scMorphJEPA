@@ -24,7 +24,7 @@ class TrainConfig:
     lr: float = 1e-4
     weight_decay: float = 0.05
     sigreg_weight: float = 10.0     # kept for backward compat; used if reg_weight is None
-    regularizer: str = "sigreg"     # sigreg | vicreg | koleo | barlow | none
+    regularizer: str = "sigreg"     # sigreg | vicreg | koleo | barlow | visreg | none
     reg_weight: float | None = None  # weight for the chosen regularizer; falls back to sigreg_weight
     reg_kwargs: dict = field(default_factory=dict)  # constructor kwargs for the regularizer
     n_images: int = 0         # 0 = use all
@@ -213,15 +213,16 @@ class Trainer:
             "history": self.history,
             "run_name": self.run_name,
         }
-        # Full state to LOCAL every epoch (cheap, for in-session resume).
+        # LOCAL gets the FULL checkpoint (with optimizer) every epoch — exact same-session resume.
         self._atomic_save(ckpt, self.output_dir / "last.pt")
-        # To DRIVE every drive_save_every epochs (and on the final epoch). Default is every
-        # epoch (drive_save_every=1) so a runtime reset never loses completed epochs. Raise it
-        # only if Drive revisions become a problem (then empty Drive Trash periodically); the
-        # progress file's recoverable_epoch always reports the true cross-session resume point.
+        # DRIVE gets an OPTIMIZER-FREE checkpoint. The Adam state is ~2/3 of the file and the main
+        # reason a ~250 MB upload does not finish syncing to Google before a Colab reset; dropping
+        # it makes the Drive copy small enough to sync reliably every time. On a cross-session
+        # resume the optimizer is re-initialized (Adam re-warms within a few steps).
         is_final = (epoch + 1) == self.config.epochs
         if self.drive_dir and ((epoch + 1) % self.config.drive_save_every == 0 or is_final):
-            self._atomic_save(ckpt, self.drive_dir / f"{self.run_name}_last.pt")
+            drive_ckpt = {k: v for k, v in ckpt.items() if k != "optimizer_state_dict"}
+            self._atomic_save(drive_ckpt, self.drive_dir / f"{self.run_name}_last.pt")
             self._last_drive_epoch = epoch
 
         # Tiny human-readable progress file EVERY epoch (negligible size) so you can see how
@@ -252,27 +253,45 @@ class Trainer:
             (self.drive_dir / f"{self.run_name}_progress.json").write_text(text)
 
     def _maybe_resume(self) -> int:
-        """Load the most recent resume checkpoint if present. Returns the next epoch index."""
+        """Load the FRESHEST resume checkpoint (highest completed epoch), never a fixed path order —
+        a stale Drive copy must not override a fresher local one. Returns the next epoch index."""
         if not self.config.resume:
             return 0
+        best = None  # (epoch, path, ckpt)
         for p in self._resume_paths():
-            if Path(p).exists():
-                ckpt = torch.load(p, map_location=self.device, weights_only=False)
-                self.model.load_state_dict(ckpt["model_state_dict"])
-                self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-                self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-                self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
-                self.history = ckpt.get("history", [])
-                loaded_epoch = int(ckpt["epoch"])
-                # If we loaded the Drive copy, that's also our recoverable baseline going forward.
-                if self.drive_dir and Path(p) == self.drive_dir / f"{self.run_name}_last.pt":
-                    self._last_drive_epoch = loaded_epoch
-                next_epoch = loaded_epoch + 1
-                src = "Drive" if (self.drive_dir and Path(p) == self.drive_dir / f"{self.run_name}_last.pt") else "local"
-                logger.info(f"Resumed '{self.run_name}' from {src} checkpoint "
-                            f"(completed epoch {loaded_epoch + 1}) → continuing at epoch {next_epoch + 1}")
-                return next_epoch
-        return 0
+            if not Path(p).exists():
+                continue
+            try:
+                ck = torch.load(p, map_location="cpu", weights_only=False)
+                ep = int(ck["epoch"])
+            except Exception:
+                continue
+            if best is None or ep > best[0]:
+                best = (ep, Path(p), ck)
+        if best is None:
+            return 0
+        loaded_epoch, path, ckpt = best
+        self.model.load_state_dict(ckpt["model_state_dict"])
+        self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
+        if "optimizer_state_dict" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+            for st in self.optimizer.state.values():  # move loaded (CPU) state onto the device
+                for k, v in st.items():
+                    if isinstance(v, torch.Tensor):
+                        st[k] = v.to(self.device)
+            opt_note = ""
+        else:
+            opt_note = " (optimizer re-initialized: Drive checkpoint omits it)"
+        self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
+        self.history = ckpt.get("history", [])
+        on_drive = bool(self.drive_dir) and path == self.drive_dir / f"{self.run_name}_last.pt"
+        if on_drive:
+            self._last_drive_epoch = loaded_epoch
+        next_epoch = loaded_epoch + 1
+        src = "Drive" if on_drive else "local"
+        logger.info(f"Resumed '{self.run_name}' from {src} checkpoint "
+                    f"(completed epoch {loaded_epoch + 1}) → continuing at epoch {next_epoch + 1}{opt_note}")
+        return next_epoch
 
     def _train_epoch(self, epoch: int = 0) -> dict:
         self.model.train()

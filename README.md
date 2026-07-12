@@ -20,17 +20,9 @@ On the [Severin PBMC dataset](https://doi.org/10.3929/ethz-b-000343106) (113,564
 
 > scMorphJEPA improves over the zero-shot pretrained baseline with only 1,000 training images, demonstrating strong data efficiency. Note: baseline and model numbers above were measured under their original preprocessing; a normalization-matched comparison and full-scale runs are in progress (see Ongoing Work).
 
-### Normalization study (5,000 images, 40 epochs, SIGReg)
+### Normalization and objective studies (in progress)
 
-Holding data size, epochs, and objective fixed and varying only the input normalization, so the comparison isolates a single factor:
-
-| Normalization | k-NN (k=5) | k-NN (k=10) | k-NN (k=20) |
-|---------------|-----------|------------|------------|
-| per_channel | 67.0% | 67.4% | 67.1% |
-| per_channel_percentile | 60.5% | 61.3% | 61.3% |
-| per_image | _in progress_ | _in progress_ | _in progress_ |
-
-Robust percentile clipping (per_channel_percentile) lowers k-NN here, consistent with the brightest pixels carrying real marker signal rather than artifact. The VICReg objective on the two strongest normalizations will be added next.
+A controlled comparison across input normalizations (`none`/raw, `per_image`, `per_channel`, `per_channel_percentile`) and regularizers (SIGReg, VICReg, VISReg, KoLeo, Barlow) is underway. Earlier per-normalization numbers are being re-validated: a preprocessing issue, where an unrecognized normalize string could silently fall back to raw pixels, was found and fixed in v0.1.9, which now validates the normalization at dataset construction. Matched-budget results will be posted here once the controlled runs complete.
 
 ## Motivation
 
@@ -128,12 +120,12 @@ from scmorphjepa.training.trainer import Trainer, TrainConfig
 
 model = build_scmorphjepa("dino_vits16.pth", ScMorphJEPAConfig(in_channels=5))
 
-train_ds = SeverinDataset("severin_data/.../Training", normalize="per_image")
+train_ds = SeverinDataset("severin_data/.../Training", normalize="per_image")  # none | per_image | per_channel | per_channel_percentile
 val_ds   = SeverinDataset("severin_data/.../Test",     normalize="per_image")
 
 cfg = TrainConfig(
     batch_size=24, epochs=50,
-    regularizer="sigreg",      # sigreg | vicreg | koleo | barlow | none
+    regularizer="sigreg",      # sigreg | vicreg | koleo | barlow | visreg | none
     n_images=0,                # 0 = use all
     output_dir="output",
 )
@@ -163,9 +155,9 @@ scMorphJEPA/
 ├── scmorphjepa/            # installable package
 │   ├── models/             # encoder, predictor, builder, baselines
 │   ├── data/               # dataset loaders (Severin + generic folder)
-│   ├── training/           # trainer + regularizers (sigreg, vicreg, koleo, barlow)
+│   ├── training/           # trainer + regularizers (sigreg, vicreg, koleo, barlow, visreg)
 │   ├── evaluation/         # k-NN, linear probe, clustering metrics
-│   ├── analysis/           # interpretability, channel attribution
+│   ├── analysis/           # interpretability, channel attribution, cluster feature profiling
 │   └── cli.py              # command-line train / evaluate / analyze
 ├── configs/                # run configs
 ├── tests/
@@ -187,8 +179,8 @@ Both prediction loss and SIGReg loss decrease consistently during training, conf
 
 ## Ongoing Work
 
-- [ ] Normalization study (per_image vs per_channel vs per_channel_percentile) at matched budget
-- [ ] Objective ablation (SIGReg vs VICReg vs KoLeo vs Barlow)
+- [ ] Normalization study (none/raw vs per_image vs per_channel vs per_channel_percentile) at matched budget
+- [ ] Objective ablation (SIGReg vs VICReg vs VISReg vs KoLeo vs Barlow)
 - [ ] Full scaling curve (1K to 89K images) with consistent training
 - [ ] Normalization-matched comparison with scDINO (reproduction on same dataset)
 - [ ] Cross-channel latent-predictive JEPA and channel predictability map

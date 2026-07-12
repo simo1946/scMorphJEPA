@@ -284,3 +284,34 @@ def test_visreg_finite_differentiable_penalizes_collapse():
 
     collapsed = torch.randn(1, 128).repeat(64, 1) + 1e-4 * torch.randn(64, 128)
     assert reg(collapsed).item() > lg.item()          # collapse costs more
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_resume_drive_is_optimizer_free_and_resumes(tmp_path):
+    """Drive checkpoint omits the optimizer (so it syncs) and a fresh-runtime resume continues
+    from the right epoch with the optimizer re-initialized."""
+    import shutil
+    import torch
+    from torch.utils.data import TensorDataset
+    from scmorphjepa.models.builder import build_scmorphjepa
+    from scmorphjepa.models.cell_jepa import ScMorphJEPAConfig
+    from scmorphjepa.training.trainer import Trainer, TrainConfig
+
+    ds = TensorDataset(torch.rand(8, 5, 224, 224), torch.randint(0, 2, (8,)))
+    out = tmp_path / "out"
+    drv = tmp_path / "drive"
+
+    def mk(epochs):
+        m = build_scmorphjepa(None, ScMorphJEPAConfig(in_channels=5))
+        cfg = TrainConfig(batch_size=4, epochs=epochs, num_workers=0, output_dir=str(out),
+                          device="cpu", n_images=0, drive_checkpoint_dir=str(drv),
+                          run_name="rtest", drive_save_every=1, save_every=999, resume=True)
+        return Trainer(m, ds, ds, cfg)
+
+    mk(2).train()
+    drive_ckpt = torch.load(drv / "rtest_last.pt", map_location="cpu", weights_only=False)
+    assert "optimizer_state_dict" not in drive_ckpt          # durability fix: Drive copy is small
+    assert int(drive_ckpt["epoch"]) == 1                     # 2 epochs done (0-indexed last = 1)
+
+    shutil.rmtree(out); out.mkdir()                          # simulate a fresh runtime (local wiped)
+    assert mk(3)._maybe_resume() == 2                        # continue at epoch index 2 (the 3rd)
