@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -36,7 +37,9 @@ class TrainConfig:
     run_name: str = ""        # if empty, auto-derived; namespaces all checkpoints for this run
     drive_checkpoint_dir: str | None = None  # if set, the best model is also copied here (e.g. Drive)
     resume: bool = True       # auto-resume from the last checkpoint if one exists (Colab-safe)
-    drive_save_every: int = 1  # mirror the resume checkpoint to Drive every N epochs (1 = every epoch)
+    drive_save_every: int = 2  # write the full checkpoint to Drive every N epochs. The checkpoint
+                               # is complete (model + full Adam state), so a reset costs at most
+                               # N-1 epochs, and progress.json reports exactly how many are at risk.
 
     def effective_reg_weight(self) -> float:
         return self.reg_weight if self.reg_weight is not None else self.sigreg_weight
@@ -113,7 +116,11 @@ class Trainer:
             self.drive_dir.mkdir(parents=True, exist_ok=True)
         self.best_val_loss = float("inf")
         self.history: list[dict] = []
-        self._last_drive_epoch = -1  # last epoch whose full checkpoint reached Drive (survives resets)
+        self._last_drive_epoch = -1  # last epoch whose full checkpoint VERIFIED on Drive
+        self._drive_slot_idx = 0     # alternates the two Drive slots (a/b) so a mid-write kill
+                                     # can never destroy the only good checkpoint
+        self._resume_count = 0       # how many times this run resumed (provenance: an interrupted
+        self._resume_epochs: list[int] = []   # run is not comparable to an uninterrupted one)
         logger.info(f"Run name: {self.run_name} | checkpoints → {self.output_dir}"
                     + (f" (+ Drive: {self.drive_dir})" if self.drive_dir else ""))
 
@@ -187,19 +194,45 @@ class Trainer:
 
     @staticmethod
     def _atomic_save(obj, path: Path) -> None:
-        """Save to a temp file then atomically replace — never leaves a half-written file
-        (important on Drive when a Colab disconnect can land mid-write)."""
+        """Save to a temp file, force it out of the OS buffers, then atomically rename.
+
+        The rename means a reader never sees a half-written file, and the fsync means the bytes
+        have actually left our process rather than sitting in a buffer that a runtime kill would
+        discard.
+        """
         path = Path(path)
         tmp = path.with_suffix(path.suffix + ".tmp")
-        torch.save(obj, tmp)
-        import os
+        with open(tmp, "wb") as f:
+            torch.save(obj, f)
+            f.flush()
+            os.fsync(f.fileno())
         os.replace(tmp, path)  # atomic on the same filesystem
 
+    @staticmethod
+    def _verify_checkpoint(path: Path, expected_epoch: int) -> bool:
+        """Read a just-written checkpoint back and confirm it loads and holds the expected epoch.
+
+        This catches truncated or corrupt writes (a real failure mode when a Colab runtime is
+        killed mid-write). It is NOT a durability guarantee: on the Google Drive FUSE mount the
+        read may be served from the local cache, so a successful verify proves the file is
+        well-formed on the mount, not that Google's servers have durably received it. Only a
+        backend with confirmed writes can promise that.
+        """
+        try:
+            ck = torch.load(path, map_location="cpu", weights_only=False)
+            return int(ck.get("epoch", -1)) == int(expected_epoch) and "optimizer_state_dict" in ck
+        except Exception as e:  # truncated, corrupt, or still being written
+            logger.warning(f"Checkpoint verification failed for {path}: {e}")
+            return False
+
     def _resume_paths(self) -> list[Path]:
-        """Where a resume checkpoint might live (Drive first so it survives VM resets)."""
+        """Every place a resume checkpoint might live. Order does not matter: _maybe_resume picks
+        the one with the highest completed epoch that actually loads."""
         paths = []
         if self.drive_dir:
-            paths.append(self.drive_dir / f"{self.run_name}_last.pt")
+            paths.append(self.drive_dir / f"{self.run_name}_last_a.pt")
+            paths.append(self.drive_dir / f"{self.run_name}_last_b.pt")
+            paths.append(self.drive_dir / f"{self.run_name}_last.pt")  # legacy single-slot name
         paths.append(self.output_dir / "last.pt")
         return paths
 
@@ -212,18 +245,34 @@ class Trainer:
             "best_val_loss": self.best_val_loss,
             "history": self.history,
             "run_name": self.run_name,
+            "resume_count": self._resume_count,
+            "resume_epochs": self._resume_epochs,
         }
-        # LOCAL gets the FULL checkpoint (with optimizer) every epoch — exact same-session resume.
+        # LOCAL: full checkpoint every epoch (free, exact same-session resume).
         self._atomic_save(ckpt, self.output_dir / "last.pt")
-        # DRIVE gets an OPTIMIZER-FREE checkpoint. The Adam state is ~2/3 of the file and the main
-        # reason a ~250 MB upload does not finish syncing to Google before a Colab reset; dropping
-        # it makes the Drive copy small enough to sync reliably every time. On a cross-session
-        # resume the optimizer is re-initialized (Adam re-warms within a few steps).
+
+        # DRIVE: the FULL checkpoint, including the complete fp32 Adam state. The optimizer state
+        # is never pruned: dropping it would restart Adam's moments and step counter on every
+        # cross-session resume, perturbing the optimization trajectory and silently corrupting
+        # any comparison between an interrupted run and an uninterrupted one.
+        #
+        # Two slots are written alternately so that a runtime killed mid-write can corrupt at most
+        # one of them; the previously verified slot always survives. `_last_drive_epoch` (and hence
+        # progress.json's recoverable_epoch) is advanced ONLY after the written file reads back
+        # correctly, so the progress file can never claim an epoch that is not actually recoverable.
         is_final = (epoch + 1) == self.config.epochs
         if self.drive_dir and ((epoch + 1) % self.config.drive_save_every == 0 or is_final):
-            drive_ckpt = {k: v for k, v in ckpt.items() if k != "optimizer_state_dict"}
-            self._atomic_save(drive_ckpt, self.drive_dir / f"{self.run_name}_last.pt")
-            self._last_drive_epoch = epoch
+            slot = "a" if (self._drive_slot_idx % 2 == 0) else "b"
+            target = self.drive_dir / f"{self.run_name}_last_{slot}.pt"
+            self._atomic_save(ckpt, target)
+            if self._verify_checkpoint(target, epoch):
+                self._last_drive_epoch = epoch
+                self._drive_slot_idx += 1  # only rotate on success, so a bad slot is overwritten next
+            else:
+                logger.warning(
+                    f"Drive checkpoint for epoch {epoch + 1} did not verify; recoverable epoch "
+                    f"stays at {self._last_drive_epoch + 1}. The previous verified slot is intact."
+                )
 
         # Tiny human-readable progress file EVERY epoch (negligible size) so you can see how
         # far a run got — open it on Drive without loading the big checkpoint.
@@ -236,11 +285,16 @@ class Trainer:
         # recoverable_epoch = where a FRESH-runtime resume will actually start from, i.e. the last
         # epoch whose full checkpoint reached Drive. With drive_save_every=1 this equals
         # epoch_completed; if throttled, it can lag, and this field tells you by how much.
+        # recoverable_epoch = the last epoch whose checkpoint VERIFIED on Drive, i.e. what a
+        # fresh-runtime resume will actually get. It never over-reports.
         recoverable = self._last_drive_epoch + 1 if self.drive_dir else epoch + 1
         prog = {
             "run_name": self.run_name,
             "epoch_completed": epoch + 1,
             "recoverable_epoch": recoverable,
+            "epochs_at_risk": max(0, (epoch + 1) - recoverable),
+            "resume_count": self._resume_count,
+            "resume_epochs": self._resume_epochs,
             "total_epochs": self.config.epochs,
             "percent": round(100 * (epoch + 1) / self.config.epochs, 1),
             "best_val_loss": round(float(self.best_val_loss), 6),
@@ -273,24 +327,38 @@ class Trainer:
         loaded_epoch, path, ckpt = best
         self.model.load_state_dict(ckpt["model_state_dict"])
         self.scheduler.load_state_dict(ckpt["scheduler_state_dict"])
-        if "optimizer_state_dict" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
-            for st in self.optimizer.state.values():  # move loaded (CPU) state onto the device
-                for k, v in st.items():
-                    if isinstance(v, torch.Tensor):
-                        st[k] = v.to(self.device)
-            opt_note = ""
-        else:
-            opt_note = " (optimizer re-initialized: Drive checkpoint omits it)"
+        if "optimizer_state_dict" not in ckpt:
+            # Only pre-0.1.13 Drive checkpoints lack this. Resuming from one would restart Adam's
+            # moments and step counter, silently changing the optimization trajectory, so refuse.
+            raise RuntimeError(
+                f"Checkpoint {path} has no optimizer state (written by scmorphjepa < 0.1.13). "
+                "Resuming would re-initialize Adam and corrupt the run. Delete it and restart, "
+                "or resume from a checkpoint written by >= 0.1.13."
+            )
+        self.optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+        for st in self.optimizer.state.values():  # move loaded (CPU) state onto the device
+            for k, v in st.items():
+                if isinstance(v, torch.Tensor):
+                    st[k] = v.to(self.device)
         self.best_val_loss = ckpt.get("best_val_loss", float("inf"))
         self.history = ckpt.get("history", [])
-        on_drive = bool(self.drive_dir) and path == self.drive_dir / f"{self.run_name}_last.pt"
+        # Provenance: this run was interrupted. Carry the count forward so every checkpoint and
+        # progress file records it, and a resumed run can be told apart from a clean one.
+        self._resume_count = int(ckpt.get("resume_count", 0)) + 1
+        self._resume_epochs = list(ckpt.get("resume_epochs", [])) + [int(ckpt["epoch"]) + 1]
+        on_drive = bool(self.drive_dir) and path.parent == self.drive_dir
         if on_drive:
             self._last_drive_epoch = loaded_epoch
+            # keep writing to the OTHER slot next, so the one we just resumed from stays intact
+            self._drive_slot_idx = 1 if path.name.endswith("_last_a.pt") else 0
         next_epoch = loaded_epoch + 1
         src = "Drive" if on_drive else "local"
-        logger.info(f"Resumed '{self.run_name}' from {src} checkpoint "
-                    f"(completed epoch {loaded_epoch + 1}) → continuing at epoch {next_epoch + 1}{opt_note}")
+        logger.info(
+            f"Resumed '{self.run_name}' from {src} checkpoint {path.name} "
+            f"(completed epoch {loaded_epoch + 1}) → continuing at epoch {next_epoch + 1} "
+            f"with full optimizer state. This run has now resumed {self._resume_count}x "
+            f"(at epochs {self._resume_epochs})."
+        )
         return next_epoch
 
     def _train_epoch(self, epoch: int = 0) -> dict:

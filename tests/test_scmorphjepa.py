@@ -287,9 +287,12 @@ def test_visreg_finite_differentiable_penalizes_collapse():
 
 
 @pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
-def test_resume_drive_is_optimizer_free_and_resumes(tmp_path):
-    """Drive checkpoint omits the optimizer (so it syncs) and a fresh-runtime resume continues
-    from the right epoch with the optimizer re-initialized."""
+def test_resume_preserves_full_optimizer_state(tmp_path):
+    """A cross-session resume must restore Adam EXACTLY (moments + step), not re-initialize it.
+
+    This is the regression test for the v0.1.12 defect: dropping the optimizer state from the
+    Drive checkpoint silently perturbed the optimization trajectory of every resumed run.
+    """
     import shutil
     import torch
     from torch.utils.data import TensorDataset
@@ -298,8 +301,7 @@ def test_resume_drive_is_optimizer_free_and_resumes(tmp_path):
     from scmorphjepa.training.trainer import Trainer, TrainConfig
 
     ds = TensorDataset(torch.rand(8, 5, 224, 224), torch.randint(0, 2, (8,)))
-    out = tmp_path / "out"
-    drv = tmp_path / "drive"
+    out, drv = tmp_path / "out", tmp_path / "drive"
 
     def mk(epochs):
         m = build_scmorphjepa(None, ScMorphJEPAConfig(in_channels=5))
@@ -308,10 +310,62 @@ def test_resume_drive_is_optimizer_free_and_resumes(tmp_path):
                           run_name="rtest", drive_save_every=1, save_every=999, resume=True)
         return Trainer(m, ds, ds, cfg)
 
-    mk(2).train()
-    drive_ckpt = torch.load(drv / "rtest_last.pt", map_location="cpu", weights_only=False)
-    assert "optimizer_state_dict" not in drive_ckpt          # durability fix: Drive copy is small
-    assert int(drive_ckpt["epoch"]) == 1                     # 2 epochs done (0-indexed last = 1)
+    tr = mk(2)
+    tr.train()
 
-    shutil.rmtree(out); out.mkdir()                          # simulate a fresh runtime (local wiped)
-    assert mk(3)._maybe_resume() == 2                        # continue at epoch index 2 (the 3rd)
+    # The Drive checkpoint must contain the FULL optimizer state.
+    slot = drv / "rtest_last_a.pt"
+    assert slot.exists(), "Drive slot a not written"
+    ck = torch.load(slot, map_location="cpu", weights_only=False)
+    assert "optimizer_state_dict" in ck, "Drive checkpoint must keep the optimizer state"
+    saved_step = ck["optimizer_state_dict"]["state"][0]["step"]
+    saved_exp_avg = ck["optimizer_state_dict"]["state"][0]["exp_avg"].clone()
+    assert float(saved_step) > 0, "Adam step counter should be non-zero after training"
+
+    # progress.json must not over-report what is recoverable.
+    import json
+    prog = json.loads((drv / "rtest_progress.json").read_text())
+    assert prog["recoverable_epoch"] == prog["epoch_completed"]
+    assert prog["epochs_at_risk"] == 0
+    assert prog["resume_count"] == 0
+
+    # Simulate a fresh runtime: local is wiped, only Drive survives.
+    shutil.rmtree(out)
+    out.mkdir()
+    tr2 = mk(3)
+    next_epoch = tr2._maybe_resume()
+    assert next_epoch == 2, f"expected to continue at epoch index 2, got {next_epoch}"
+
+    # Adam must be restored EXACTLY, not re-initialized.
+    restored = tr2.optimizer.state_dict()["state"][0]
+    assert float(restored["step"]) == float(saved_step), "Adam step counter was reset"
+    assert torch.allclose(restored["exp_avg"], saved_exp_avg), "Adam moments were not restored"
+    assert tr2._resume_count == 1 and tr2._resume_epochs == [2]   # provenance recorded
+
+
+@pytest.mark.skipif(not HAS_TORCH, reason="torch not installed")
+def test_resume_refuses_optimizer_free_checkpoint(tmp_path):
+    """A pre-0.1.13 (optimizer-free) checkpoint must raise, not silently re-init Adam."""
+    import torch
+    from torch.utils.data import TensorDataset
+    from scmorphjepa.models.builder import build_scmorphjepa
+    from scmorphjepa.models.cell_jepa import ScMorphJEPAConfig
+    from scmorphjepa.training.trainer import Trainer, TrainConfig
+
+    ds = TensorDataset(torch.rand(4, 5, 224, 224), torch.randint(0, 2, (4,)))
+    out, drv = tmp_path / "out", tmp_path / "drive"
+    out.mkdir()
+    drv.mkdir()
+
+    m = build_scmorphjepa(None, ScMorphJEPAConfig(in_channels=5))
+    cfg = TrainConfig(batch_size=4, epochs=2, num_workers=0, output_dir=str(out), device="cpu",
+                      n_images=0, drive_checkpoint_dir=str(drv), run_name="legacy",
+                      drive_save_every=1, save_every=999, resume=True)
+    tr = Trainer(m, ds, ds, cfg)
+
+    # legacy-style checkpoint: no optimizer_state_dict
+    torch.save({"epoch": 3, "model_state_dict": tr.model.state_dict(),
+                "scheduler_state_dict": tr.scheduler.state_dict()},
+               drv / "legacy_last.pt")
+    with pytest.raises(RuntimeError, match="no optimizer state"):
+        tr._maybe_resume()

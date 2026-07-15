@@ -1,5 +1,24 @@
 # Changelog
 
+## v0.1.13 — Correct resume: full optimizer state, verified writes, run provenance
+
+- REVERTS a correctness regression in v0.1.12. The Drive checkpoint omitted the Adam optimizer
+  state, so every cross-session resume restarted Adam with zeroed moments and a reset step
+  counter, perturbing the optimization trajectory. Any run that resumed is therefore not
+  comparable to one that did not. The Drive checkpoint now always contains the COMPLETE fp32
+  optimizer state; nothing is pruned to save space.
+- Checkpoint writes are now fsync'd and verified: the file is read back and its epoch checked
+  before `recoverable_epoch` advances, so progress.json can never claim an epoch that is not
+  actually recoverable. (Note: on the Drive FUSE mount this catches truncated/corrupt writes but
+  is not a durability guarantee, the read may be served from the local cache.)
+- Two rotating Drive slots (`_last_a.pt` / `_last_b.pt`): a runtime killed mid-write can corrupt
+  at most one, and the previously verified checkpoint always survives.
+- progress.json now reports `epochs_at_risk`, `resume_count` and `resume_epochs`; the checkpoint
+  carries the same provenance, so an interrupted run can always be told apart from a clean one.
+- Resuming from a pre-0.1.13 optimizer-free checkpoint now raises instead of silently
+  re-initializing Adam.
+- `drive_save_every` default is 2 (was 1). The worst-case loss on a reset is bounded and reported.
+
 ## v0.1.12 — Reliable Colab resume (Drive durability)
 
 - Fixed cross-session resume dropping many completed epochs. Two causes: (1) resume loaded the
