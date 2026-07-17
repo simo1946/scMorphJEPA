@@ -313,10 +313,13 @@ def test_resume_preserves_full_optimizer_state(tmp_path):
     tr = mk(2)
     tr.train()
 
-    # The Drive checkpoint must contain the FULL optimizer state.
-    slot = drv / "rtest_last_a.pt"
-    assert slot.exists(), "Drive slot a not written"
-    ck = torch.load(slot, map_location="cpu", weights_only=False)
+    # The Drive checkpoint must contain the FULL optimizer state. With two rotating slots, the
+    # LATEST epoch is in whichever slot has the highest "epoch" — read that one (the resume will
+    # load the same freshest checkpoint), not a hard-coded slot name.
+    slots = list(drv.glob("rtest_last_*.pt"))
+    assert slots, "no Drive checkpoint slot written"
+    loaded = [(torch.load(s, map_location="cpu", weights_only=False), s) for s in slots]
+    ck, _ = max(loaded, key=lambda t: int(t[0]["epoch"]))
     assert "optimizer_state_dict" in ck, "Drive checkpoint must keep the optimizer state"
     saved_step = ck["optimizer_state_dict"]["state"][0]["step"]
     saved_exp_avg = ck["optimizer_state_dict"]["state"][0]["exp_avg"].clone()
@@ -336,9 +339,10 @@ def test_resume_preserves_full_optimizer_state(tmp_path):
     next_epoch = tr2._maybe_resume()
     assert next_epoch == 2, f"expected to continue at epoch index 2, got {next_epoch}"
 
-    # Adam must be restored EXACTLY, not re-initialized.
+    # Adam must be restored EXACTLY from the freshest checkpoint, not re-initialized.
     restored = tr2.optimizer.state_dict()["state"][0]
-    assert float(restored["step"]) == float(saved_step), "Adam step counter was reset"
+    assert float(restored["step"]) > 0, "Adam step counter was reset to 0 (optimizer re-initialized)"
+    assert float(restored["step"]) == float(saved_step), "Adam step not restored from the freshest slot"
     assert torch.allclose(restored["exp_avg"], saved_exp_avg), "Adam moments were not restored"
     assert tr2._resume_count == 1 and tr2._resume_epochs == [2]   # provenance recorded
 
